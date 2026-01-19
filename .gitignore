@@ -1,11 +1,4 @@
-# Generated EPG and Playlist files
-guide.xml
-playlist-filtered.m3u
-
-# Original playlist downloads
-*.m3u
-
-# EPG workspace
+# EPG workspace (keep generated files but ignore workspace)
 epg-workspace/
 
 # Python cache
