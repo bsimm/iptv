@@ -20,7 +20,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-M3U_URL = "https://iptv-org.github.io/iptv/categories/legislative.m3u"
+URLS_FILE = "./urls"
 EPG_REPO = "https://github.com/iptv-org/epg.git"
 WORK_DIR = "./epg-workspace"
 OUTPUT_GUIDE = "./guide.xml"
@@ -38,6 +38,23 @@ def run_command(cmd, cwd=None, check=True):
         cmd, shell=True, cwd=cwd, capture_output=True, text=True, check=check
     )
     return result.stdout
+
+
+def read_urls_file():
+    """Read URLs from the urls file"""
+    urls_path = Path(URLS_FILE)
+    if not urls_path.exists():
+        print(f"ERROR: URLs file not found: {URLS_FILE}")
+        sys.exit(1)
+
+    with open(urls_path, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+    if not urls:
+        print(f"ERROR: No URLs found in {URLS_FILE}")
+        sys.exit(1)
+
+    return urls
 
 
 def parse_m3u(m3u_content):
@@ -234,14 +251,28 @@ def main():
         channels_root = cache["channels_root"]
         matched_count = len(matched_channels)
     else:
-        # Download and parse M3U
-        print("[4/6] Downloading M3U playlist...")
-        with urllib.request.urlopen(M3U_URL) as response:
-            m3u_content = response.read().decode("utf-8")
+        # Read URLs from file
+        print("[4/6] Downloading M3U playlists...")
+        m3u_urls = read_urls_file()
+        print(f"Found {len(m3u_urls)} playlist URL(s) in {URLS_FILE}")
 
-        channels = parse_m3u(m3u_content)
+        all_channels = []
+        for idx, m3u_url in enumerate(m3u_urls, 1):
+            print(f"  [{idx}/{len(m3u_urls)}] Downloading {m3u_url}...")
+            try:
+                with urllib.request.urlopen(m3u_url) as response:
+                    m3u_content = response.read().decode("utf-8")
+
+                playlist_channels = parse_m3u(m3u_content)
+                all_channels.extend(playlist_channels)
+                print(f"       Found {len(playlist_channels)} channels")
+            except Exception as e:
+                print(f"       ERROR: Failed to download playlist: {e}")
+                continue
+
+        channels = all_channels
         total_channels = len(channels)
-        print(f"Found {total_channels} channels in M3U playlist\n")
+        print(f"\nTotal: {total_channels} channels from all playlists\n")
 
         # Match channels with EPG sources
         print("[5/6] Matching channels with EPG sources and filtering playlist...")
