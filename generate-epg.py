@@ -30,6 +30,24 @@ CACHE_MAX_AGE = 24 * 60 * 60  # 24 hours in seconds
 GUIDE_CACHE_MAX_AGE = 12 * 60 * 60  # 12 hours in seconds
 MAX_CONNECTIONS = 5  # Number of parallel EPG requests (increase for faster processing)
 EPG_DAYS = 1  # Number of days to fetch EPG data for (1-2 recommended)
+MAX_CHANNELS = 25  # Maximum number of channels to include (set to 0 for unlimited)
+
+# Reliable CDN domains (higher scores = more reliable)
+RELIABLE_DOMAINS = {
+    "amagi.tv": 10,
+    "uplynk.com": 10,
+    "pbs.org": 9,
+    "fuelmedia.io": 8,
+    "cloudfront.net": 7,
+    "tsv2.amagi.tv": 10,
+    "cvalley.net": 6,
+}
+
+# Must-include channels (always included regardless of score)
+PRIORITY_CHANNELS = [
+    "CSPAN.us",
+    "CSPAN2.us",
+]
 
 
 def run_command(cmd, cwd=None, check=True):
@@ -55,6 +73,52 @@ def read_urls_file():
         sys.exit(1)
 
     return urls
+
+
+def calculate_reliability_score(channel):
+    """Calculate reliability score for a channel based on various factors"""
+    score = 0
+    stream_url = channel["stream_url"].lower()
+    tvg_id = channel.get("tvg_id", "")
+
+    # Check if it's a priority channel (must-include)
+    for priority in PRIORITY_CHANNELS:
+        if priority.lower() in tvg_id.lower():
+            return 1000  # Very high score to ensure inclusion
+
+    # Score based on CDN domain
+    for domain, domain_score in RELIABLE_DOMAINS.items():
+        if domain in stream_url:
+            score += domain_score
+            break
+
+    # Bonus for major networks (based on tvg-id or metadata)
+    metadata_text = " ".join(channel["metadata_lines"]).lower()
+    major_networks = ["nbc", "cbs", "abc", "fox", "pbs"]
+    for network in major_networks:
+        if network in metadata_text or network in tvg_id.lower():
+            score += 5
+            break
+
+    # Bonus for government/legislative channels
+    if "legislative" in metadata_text or "government" in metadata_text:
+        score += 8
+
+    # Bonus for news channels (typically more reliable)
+    if "news" in metadata_text:
+        score += 3
+
+    # Bonus for education channels (PBS, etc.)
+    if "education" in metadata_text:
+        score += 4
+
+    # Penalty for geo-blocked or not 24/7
+    if "[geo-blocked]" in metadata_text.lower():
+        score -= 3
+    if "[not 24/7]" in metadata_text.lower():
+        score -= 2
+
+    return score
 
 
 def parse_m3u(m3u_content):
@@ -219,6 +283,12 @@ def main():
         default=EPG_DAYS,
         help=f"Number of days to fetch EPG data for (default: {EPG_DAYS})",
     )
+    parser.add_argument(
+        "--max-channels",
+        type=int,
+        default=MAX_CHANNELS,
+        help=f"Maximum number of channels to include (default: {MAX_CHANNELS}, 0 = unlimited)",
+    )
     args = parser.parse_args()
 
     print("=== Jellyfin IPTV EPG Generator ===\n")
@@ -307,6 +377,39 @@ def main():
         print(
             f"Removed {total_channels - matched_count - skipped_count} channels without EPG\n"
         )
+
+        # Filter to most reliable channels if max_channels is set
+        if args.max_channels > 0 and len(matched_channels) > args.max_channels:
+            print(f"[Reliability Filter] Selecting top {args.max_channels} most reliable channels...")
+
+            # Calculate reliability scores for all matched channels
+            scored_channels = []
+            for channel in matched_channels:
+                score = calculate_reliability_score(channel)
+                scored_channels.append((score, channel))
+
+            # Sort by score (descending) and take top max_channels
+            scored_channels.sort(key=lambda x: x[0], reverse=True)
+            top_channels = [ch for score, ch in scored_channels[:args.max_channels]]
+
+            # Show what was selected
+            print(f"\nTop {args.max_channels} channels selected:")
+            for score, channel in scored_channels[:args.max_channels]:
+                tvg_id = channel.get("tvg_id", "Unknown")
+                print(f"  ✓ {tvg_id} (score: {score})")
+
+            # Update matched_channels and rebuild channels_root
+            matched_channels = top_channels
+            channels_root = ET.Element("channels")
+            for channel in matched_channels:
+                channel_element = find_channel_in_sites(channel["tvg_id"], sites_dir)
+                if channel_element is not None:
+                    channels_root.append(channel_element)
+
+            matched_count = len(matched_channels)
+            print(f"\nFiltered to {matched_count} channels\n")
+        elif args.max_channels > 0:
+            print(f"[Reliability Filter] All {matched_count} channels included (under limit of {args.max_channels})\n")
 
         # Save to cache
         save_channel_cache(matched_channels, channels_root)
