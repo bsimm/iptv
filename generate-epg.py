@@ -45,8 +45,9 @@ RELIABLE_DOMAINS = {
 
 # Must-include channels (always included regardless of score)
 PRIORITY_CHANNELS = [
-    "CSPAN.us",
-    "CSPAN2.us",
+    "CSPAN.us@SD",
+    "CSPAN2.us@SD",
+    "CSPAN3.us@SD",
 ]
 
 
@@ -59,20 +60,72 @@ def run_command(cmd, cwd=None, check=True):
 
 
 def read_urls_file():
-    """Read URLs from the urls file"""
+    """Read URLs from the urls file. Returns empty list if file is missing or blank."""
     urls_path = Path(URLS_FILE)
     if not urls_path.exists():
-        print(f"ERROR: URLs file not found: {URLS_FILE}")
-        sys.exit(1)
-
+        return []
     with open(urls_path, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
-    if not urls:
-        print(f"ERROR: No URLs found in {URLS_FILE}")
-        sys.exit(1)
 
-    return urls
+def fetch_priority_streams_via_gh(priority_channels):
+    """Fetch M3U streams for priority channels from iptv-org/iptv via gh CLI.
+
+    Lists all stream files matching each country prefix derived from channel IDs
+    (e.g. CSPAN.us → us.m3u, us_tvpass.m3u, us_amagi.m3u, ...) and filters to
+    matching channels.
+    """
+    # Derive country prefixes from channel ID suffixes
+    # Strip @variant first: "CSPAN.us@SD" → "CSPAN.us" → prefix "us"
+    prefixes = {
+        channel_id.split("@")[0].rsplit(".", 1)[-1].lower()
+        for channel_id in priority_channels
+        if "." in channel_id.split("@")[0]
+    }
+    if not prefixes:
+        print("ERROR: Could not infer country prefixes from PRIORITY_CHANNELS")
+        return []
+
+    # List all stream files and filter to those matching our prefixes
+    listing = run_command(
+        "gh api repos/iptv-org/iptv/contents/streams"
+        " --jq '[.[] | {name: .name, download_url: .download_url}]'",
+        check=False,
+    ).strip()
+    if not listing:
+        print("ERROR: Could not list iptv-org/iptv/streams via gh")
+        return []
+    try:
+        all_files = json.loads(listing)
+    except json.JSONDecodeError:
+        print("ERROR: Could not parse iptv-org/iptv/streams listing")
+        return []
+
+    def matches_prefix(name):
+        stem = name[: -len(".m3u")] if name.endswith(".m3u") else name
+        return stem in prefixes or any(stem.startswith(f"{p}_") for p in prefixes)
+
+    country_files = [f for f in all_files if matches_prefix(f["name"])]
+    print(f"  Found {len(country_files)} stream file(s) to search")
+
+    priority_ids = {p.lower() for p in priority_channels}
+    all_channels = []
+
+    for f in country_files:
+        try:
+            with urllib.request.urlopen(f["download_url"]) as resp:
+                content = resp.read().decode("utf-8")
+            matched = [
+                ch for ch in parse_m3u(content)
+                if (ch.get("tvg_id") or "").lower() in priority_ids
+            ]
+            if matched:
+                print(f"  ✓ {f['name']}: {len(matched)} priority stream(s)")
+                all_channels.extend(matched)
+        except Exception as e:
+            print(f"  ✗ {f['name']}: {e}")
+
+    return all_channels
 
 
 def calculate_reliability_score(channel):
@@ -289,6 +342,11 @@ def main():
         default=MAX_CHANNELS,
         help=f"Maximum number of channels to include (default: {MAX_CHANNELS}, 0 = unlimited)",
     )
+    parser.add_argument(
+        "--priority-only",
+        action="store_true",
+        help="Include only PRIORITY_CHANNELS in output",
+    )
     args = parser.parse_args()
 
     print("=== Jellyfin IPTV EPG Generator ===\n")
@@ -311,6 +369,8 @@ def main():
     print("[3/6] Installing dependencies...")
     run_command("npm install", cwd=epg_path)
 
+    sites_dir = epg_path / "sites"
+
     # Try to load from cache
     cache = None if args.refresh else load_channel_cache()
 
@@ -321,24 +381,30 @@ def main():
         channels_root = cache["channels_root"]
         matched_count = len(matched_channels)
     else:
-        # Read URLs from file
         print("[4/6] Downloading M3U playlists...")
-        m3u_urls = read_urls_file()
-        print(f"Found {len(m3u_urls)} playlist URL(s) in {URLS_FILE}")
+        if args.priority_only:
+            print("--priority-only: fetching streams from iptv-org/iptv via gh (ignoring urls file)...")
+            all_channels = fetch_priority_streams_via_gh(PRIORITY_CHANNELS)
+        else:
+            m3u_urls = read_urls_file()
+            if not m3u_urls:
+                print(f"ERROR: No URLs found in {URLS_FILE}")
+                sys.exit(1)
+            print(f"Found {len(m3u_urls)} playlist URL(s) in {URLS_FILE}")
 
-        all_channels = []
-        for idx, m3u_url in enumerate(m3u_urls, 1):
-            print(f"  [{idx}/{len(m3u_urls)}] Downloading {m3u_url}...")
-            try:
-                with urllib.request.urlopen(m3u_url) as response:
-                    m3u_content = response.read().decode("utf-8")
+            all_channels = []
+            for idx, m3u_url in enumerate(m3u_urls, 1):
+                print(f"  [{idx}/{len(m3u_urls)}] Downloading {m3u_url}...")
+                try:
+                    with urllib.request.urlopen(m3u_url) as response:
+                        m3u_content = response.read().decode("utf-8")
 
-                playlist_channels = parse_m3u(m3u_content)
-                all_channels.extend(playlist_channels)
-                print(f"       Found {len(playlist_channels)} channels")
-            except Exception as e:
-                print(f"       ERROR: Failed to download playlist: {e}")
-                continue
+                    playlist_channels = parse_m3u(m3u_content)
+                    all_channels.extend(playlist_channels)
+                    print(f"       Found {len(playlist_channels)} channels")
+                except Exception as e:
+                    print(f"       ERROR: Failed to download playlist: {e}")
+                    continue
 
         channels = all_channels
         total_channels = len(channels)
@@ -351,8 +417,6 @@ def main():
         matched_channels = []
         matched_count = 0
         skipped_count = 0
-
-        sites_dir = epg_path / "sites"
 
         for channel in channels:
             tvg_id = channel["tvg_id"]
@@ -378,41 +442,56 @@ def main():
             f"Removed {total_channels - matched_count - skipped_count} channels without EPG\n"
         )
 
-        # Filter to most reliable channels if max_channels is set
-        if args.max_channels > 0 and len(matched_channels) > args.max_channels:
-            print(f"[Reliability Filter] Selecting top {args.max_channels} most reliable channels...")
-
-            # Calculate reliability scores for all matched channels
-            scored_channels = []
-            for channel in matched_channels:
-                score = calculate_reliability_score(channel)
-                scored_channels.append((score, channel))
-
-            # Sort by score (descending) and take top max_channels
-            scored_channels.sort(key=lambda x: x[0], reverse=True)
-            top_channels = [ch for score, ch in scored_channels[:args.max_channels]]
-
-            # Show what was selected
-            print(f"\nTop {args.max_channels} channels selected:")
-            for score, channel in scored_channels[:args.max_channels]:
-                tvg_id = channel.get("tvg_id", "Unknown")
-                print(f"  ✓ {tvg_id} (score: {score})")
-
-            # Update matched_channels and rebuild channels_root
-            matched_channels = top_channels
-            channels_root = ET.Element("channels")
-            for channel in matched_channels:
-                channel_element = find_channel_in_sites(channel["tvg_id"], sites_dir)
-                if channel_element is not None:
-                    channels_root.append(channel_element)
-
-            matched_count = len(matched_channels)
-            print(f"\nFiltered to {matched_count} channels\n")
-        elif args.max_channels > 0:
-            print(f"[Reliability Filter] All {matched_count} channels included (under limit of {args.max_channels})\n")
-
         # Save to cache
         save_channel_cache(matched_channels, channels_root)
+
+    # Filter to priority channels only if flag is set
+    if args.priority_only:
+        priority_matched = [
+            ch for ch in matched_channels
+            if ch.get("tvg_id") in PRIORITY_CHANNELS
+        ]
+        print(f"[Priority Filter] Keeping {len(priority_matched)}/{len(matched_channels)} priority channels\n")
+        matched_channels = priority_matched
+        channels_root = ET.Element("channels")
+        for channel in matched_channels:
+            channel_element = find_channel_in_sites(channel["tvg_id"], sites_dir)
+            if channel_element is not None:
+                channels_root.append(channel_element)
+        matched_count = len(matched_channels)
+
+    # Filter to most reliable channels if max_channels is set (skip when priority_only)
+    if not args.priority_only and args.max_channels > 0 and len(matched_channels) > args.max_channels:
+        print(f"[Reliability Filter] Selecting top {args.max_channels} most reliable channels...")
+
+        # Calculate reliability scores for all matched channels
+        scored_channels = []
+        for channel in matched_channels:
+            score = calculate_reliability_score(channel)
+            scored_channels.append((score, channel))
+
+        # Sort by score (descending) and take top max_channels
+        scored_channels.sort(key=lambda x: x[0], reverse=True)
+        top_channels = [ch for score, ch in scored_channels[:args.max_channels]]
+
+        # Show what was selected
+        print(f"\nTop {args.max_channels} channels selected:")
+        for score, channel in scored_channels[:args.max_channels]:
+            tvg_id = channel.get("tvg_id", "Unknown")
+            print(f"  ✓ {tvg_id} (score: {score})")
+
+        # Update matched_channels and rebuild channels_root
+        matched_channels = top_channels
+        channels_root = ET.Element("channels")
+        for channel in matched_channels:
+            channel_element = find_channel_in_sites(channel["tvg_id"], sites_dir)
+            if channel_element is not None:
+                channels_root.append(channel_element)
+
+        matched_count = len(matched_channels)
+        print(f"\nFiltered to {matched_count} channels\n")
+    elif not args.priority_only and args.max_channels > 0:
+        print(f"[Reliability Filter] All {matched_count} channels included (under limit of {args.max_channels})\n")
 
     if matched_count == 0:
         print("=== WARNING ===")
